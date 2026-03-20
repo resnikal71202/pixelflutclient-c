@@ -2,13 +2,15 @@
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <fcntl.h>  // for open
-#include <unistd.h> // for close
+#include <netinet/tcp.h> // for TCP_NODELAY
+#include <fcntl.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <netdb.h>
-#include <time.h>   // for srand and rand
+#include <time.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
@@ -16,7 +18,7 @@ struct arg_struct
 {
     int sockfd;
     char *buf;
-    int buflen;
+    size_t buflen;
     struct addrinfo *server;
 };
 
@@ -29,20 +31,28 @@ void siginthandler(int signum)
     sig_exit = 1;
 }
 
+static void set_sock_opts(int sockfd)
+{
+    int flag = 1;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    int sndbuf = 1 << 20; // 1 MB send buffer
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+}
+
 int reconnect(struct arg_struct *arg)
 {
     close(arg->sockfd);
     int sockfd = socket(arg->server->ai_family, arg->server->ai_socktype, arg->server->ai_protocol);
     if (sockfd == -1)
     {
-        reconnect(arg);
         perror("socket");
         return -1;
     }
 
+    set_sock_opts(sockfd);
+
     if (connect(sockfd, arg->server->ai_addr, arg->server->ai_addrlen) == -1)
     {
-        reconnect(arg);
         perror("connect");
         close(sockfd);
         return -1;
@@ -55,15 +65,27 @@ int reconnect(struct arg_struct *arg)
 void *write_to_sock(void *args)
 {
     struct arg_struct *arg = (struct arg_struct *)args;
-    while (!sig_exit)
+    int failed = 0;
+    while (!sig_exit && !failed)
     {
-        ssize_t written = write(arg->sockfd, arg->buf, arg->buflen);
-        if (written == -1)
+        size_t offset = 0;
+        while (offset < arg->buflen && !sig_exit)
         {
-            // perror("write");
-            if (reconnect(arg) == -1)
+            ssize_t written = send(arg->sockfd, arg->buf + offset, arg->buflen - offset, MSG_NOSIGNAL);
+            if (written <= 0)
             {
-                break;
+                if (written == -1 && errno == EINTR)
+                    continue;
+                if (reconnect(arg) == -1)
+                {
+                    failed = 1;
+                    break;
+                }
+                offset = 0;
+            }
+            else
+            {
+                offset += (size_t)written;
             }
         }
     }
@@ -96,7 +118,6 @@ int main(int argc, char *argv[])
     }
 
     signal(SIGINT, siginthandler);
-    signal(SIGPIPE, SIG_IGN);
 
     int xoffset = atoi(argv[2]);
     int yoffset = atoi(argv[3]);
@@ -144,18 +165,15 @@ int main(int argc, char *argv[])
         int index = pixel_indices[i];
         int x = index % width;
         int y = index / width;
-        if (img[(x + y * width) * channels] != 0 ||
-            img[(x + y * width) * channels + 1] != 0 ||
-            img[(x + y * width) * channels + 2] != 0)
+        int pixel_offset = index * channels;
+        if (img[pixel_offset] != 0 ||
+            img[pixel_offset + 1] != 0 ||
+            img[pixel_offset + 2] != 0)
         {
             char temp[25];
-            snprintf(temp, 25, "PX %d %d %02x%02x%02x\n", x + xoffset, y + yoffset,
-                     img[(x + y * width) * channels],
-                     img[(x + y * width) * channels + 1],
-                     img[(x + y * width) * channels + 2]);
-
-            size_t diff = strlen(temp);
-            if (bufflen + diff > buffcap)
+            int diff = snprintf(temp, sizeof(temp), "PX %d %d %02x%02x%02x\n", x + xoffset, y + yoffset,
+                     img[pixel_offset], img[pixel_offset + 1], img[pixel_offset + 2]);
+            if (bufflen + (size_t)diff > buffcap)
             {
                 buffcap *= 2;
                 char *new_buff = realloc(buff, buffcap);
@@ -168,8 +186,8 @@ int main(int argc, char *argv[])
                 }
                 buff = new_buff;
             }
-            memcpy(&(buff[bufflen]), temp, diff);
-            bufflen += diff;
+            memcpy(&(buff[bufflen]), temp, (size_t)diff);
+            bufflen += (size_t)diff;
         }
     }
     stbi_image_free(img);
@@ -193,11 +211,13 @@ int main(int argc, char *argv[])
         int sockfd = socket(server->ai_family, server->ai_socktype, server->ai_protocol);
         if (sockfd == -1)
         {
-            perror("socket init failed");
+            perror("socket");
             free(buff);
             freeaddrinfo(server);
             return EXIT_FAILURE;
         }
+
+        set_sock_opts(sockfd);
 
         struct arg_struct *arg = malloc(sizeof(struct arg_struct));
         if (!arg)
@@ -215,9 +235,9 @@ int main(int argc, char *argv[])
 
         if (connect(sockfd, server->ai_addr, server->ai_addrlen) == -1)
         {
-            reconnect(arg);
             perror("connect");
             close(sockfd);
+            free(arg);
             free(buff);
             freeaddrinfo(server);
             return EXIT_FAILURE;
@@ -234,9 +254,9 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (int I = 0; I < num_threads; I++)
+    for (int i = 0; i < num_threads; i++)
     {
-        pthread_join(threads[I], NULL);
+        pthread_join(threads[i], NULL);
     }
 
     free(buff);
